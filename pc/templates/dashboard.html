@@ -1,0 +1,273 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Reflow Oven Control Dashboard</title>
+
+  <!-- Chart.js + pan/zoom plugin -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1"></script>
+
+  <style>
+    :root{
+      --bg:#0b0f14;
+      --panel:#121826;
+      --border:#263042;
+      --text:#e6edf3;
+      --muted:#9aa7b2;
+      --ok:#7ee787;
+      --err:#ff7b72;
+    }
+
+    body { background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, sans-serif; margin: 24px; }
+    h2 { margin-top: 0; }
+
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+
+    .card {
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:10px 12px;
+    }
+
+    .big { font-size: 24px; font-weight: 700; }
+    .muted { color:var(--muted); }
+
+    button {
+      background:var(--panel);
+      color:var(--text);
+      padding:10px 14px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      cursor:pointer;
+    }
+    button:hover { filter: brightness(1.15); }
+
+    input {
+      background:var(--panel);
+      color:var(--text);
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      width:160px;
+      outline:none;
+    }
+
+    .badge{
+      display:inline-block;
+      padding:2px 10px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      font-weight:700;
+    }
+    .badge.ok { color: var(--ok); }
+    .badge.err { color: var(--err); }
+
+    .chart-card{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:12px;
+      height: 560px; /* IMPORTANT: gives Chart.js a real height */
+    }
+  </style>
+</head>
+<body>
+  <h2>Reflow Oven Control Dashboard</h2>
+
+  <div class="row">
+    <div class="card big">Temp: <span id="temp">--</span> °C</div>
+    <div class="card">Set: <b><span id="set">--</span> °C</b></div>
+
+    <div class="card">
+      Status:
+      <span id="statusBadge" class="badge err"><span id="statusText">DISCONNECTED</span></span>
+    </div>
+
+    <div class="card">Mode: <b><span id="mode">--</span></b></div>
+    <div class="card">State: <b><span id="phase">--</span></b></div>
+    <div class="card">PWM: <b><span id="pwm">--</span>%</b></div>
+
+    <div class="card muted" id="netStatus">Polling…</div>
+  </div>
+
+  <div class="row">
+    <input id="setInput" placeholder="Set temp (25–260)" />
+    <button onclick="sendSet()">Set</button>
+    <button onclick="post('/api/start')">Start</button>
+    <button onclick="post('/api/abort')">Abort</button>
+    <button onclick="post('/api/idle')">Idle</button>
+    <button onclick="goLive()">Live</button>
+  </div>
+
+  <div class="chart-card">
+    <canvas id="chart"></canvas>
+  </div>
+
+  <script>
+    // ---- UI elements ----
+    const tempEl = document.getElementById("temp");
+    const setEl  = document.getElementById("set");
+    const modeEl = document.getElementById("mode");
+    const phaseEl= document.getElementById("phase");
+    const pwmEl  = document.getElementById("pwm");
+
+    const netStatusEl = document.getElementById("netStatus");
+    const statusTextEl = document.getElementById("statusText");
+    const statusBadgeEl = document.getElementById("statusBadge");
+
+    // ---- Strip chart settings ----
+    let followLive = true;
+    const WINDOW_S = 120;   // show last 120 seconds
+    const POLL_MS  = 500;   // UI poll rate
+    const DT_FALLBACK_S = POLL_MS / 1000.0;
+
+    // Fixed y-axis: 20..275 with 25°C increments (fits nicely on screen)
+    const Y_MIN = 20;
+    const Y_MAX = 275;
+    const Y_STEP = 25;
+
+    // ---- Chart data (use linear x-axis for time) ----
+    const ctx = document.getElementById("chart").getContext("2d");
+    const data = {
+      datasets: [
+        { label: "Temp (°C)", data: [], spanGaps: false },
+        { label: "Set (°C)",  data: [], spanGaps: false }
+      ]
+    };
+
+    const chart = new Chart(ctx, {
+      type: "line",
+      data,
+      options: {
+        animation: false,
+        parsing: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        elements: {
+          point: { radius: 0 },
+          line: { tension: 0.15 }
+        },
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "Time (s)", color: "#e6edf3" },
+            ticks: { color: "#9aa7b2", maxTicksLimit: 8 },
+            grid: { color: "rgba(154,167,178,0.15)" },
+            min: 0,
+            max: WINDOW_S
+          },
+          y: {
+            min: Y_MIN,
+            max: Y_MAX,
+            title: { display: true, text: "Temperature (°C)", color: "#e6edf3" },
+            ticks: {
+              color: "#9aa7b2",
+              stepSize: Y_STEP
+            },
+            grid: { color: "rgba(154,167,178,0.15)" }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: "#e6edf3" } },
+          zoom: {
+            pan: {
+              enabled: true,
+              mode: "x",
+              modifierKey: "shift",
+              onPanComplete: () => { followLive = false; }
+            },
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: "x",
+              onZoomComplete: () => { followLive = false; }
+            }
+          }
+        }
+      }
+    });
+
+    function setConnectedUI(connected, label) {
+      statusTextEl.textContent = label;
+      statusBadgeEl.className = connected ? "badge ok" : "badge err";
+    }
+
+    async function post(url, body) {
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: body ? JSON.stringify(body) : null
+        });
+        const j = await r.json();
+        netStatusEl.textContent = j.ok ? "OK" : ("ERROR: " + (j.err ?? ""));
+      } catch {
+        netStatusEl.textContent = "Command error";
+      }
+    }
+
+    async function sendSet() {
+      const v = parseFloat(document.getElementById("setInput").value);
+      if (Number.isNaN(v)) { netStatusEl.textContent = "Bad set value"; return; }
+      await post("/api/set", {set: v});
+    }
+
+    function goLive() {
+      followLive = true;
+      chart.resetZoom();
+      netStatusEl.textContent = "Live follow enabled";
+    }
+
+    // Local time fallback so x-axis still moves even if backend doesn't change t
+    let lastT = 0;
+
+    async function poll() {
+      try {
+        const r = await fetch("/api/latest", { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const m = await r.json();
+
+        const connected = (m.connected === true) || (m.status === "CONNECTED");
+        const statusLabel = m.status ?? (connected ? "CONNECTED" : "DISCONNECTED");
+        setConnectedUI(connected, statusLabel);
+
+        tempEl.textContent  = (m.temp == null) ? "--" : Number(m.temp).toFixed(1);
+        setEl.textContent   = (m.set  == null) ? "--" : Number(m.set).toFixed(1);
+        modeEl.textContent  = (m.mode  ?? "--");
+        phaseEl.textContent = (m.phase ?? "--");
+        pwmEl.textContent   = (m.pwm   ?? "--");
+
+        // time (seconds)
+        const t = (m.t == null) ? (lastT + DT_FALLBACK_S) : Number(m.t);
+        lastT = t;
+
+        // Append {x,y} points (null => gap)
+        data.datasets[0].data.push({ x: t, y: (m.temp == null ? null : Number(m.temp)) });
+        data.datasets[1].data.push({ x: t, y: (m.set  == null ? null : Number(m.set)) });
+
+        // Trim to window
+        const minT = t - WINDOW_S;
+        for (const ds of data.datasets) {
+          while (ds.data.length && ds.data[0].x < minT) ds.data.shift();
+        }
+
+        // Move x-axis window only (y-axis fixed)
+        if (followLive) {
+          chart.options.scales.x.min = Math.max(0, minT);
+          chart.options.scales.x.max = t;
+        }
+
+        chart.update();
+        netStatusEl.textContent = "Live";
+      } catch {
+        netStatusEl.textContent = "Poll error";
+        setConnectedUI(false, "DISCONNECTED");
+      }
+    }
+
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
