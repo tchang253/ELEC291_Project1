@@ -4,9 +4,7 @@
   <meta charset="utf-8" />
   <title>Reflow Oven Control Dashboard</title>
 
-  <!-- Chart.js + pan/zoom plugin -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1"></script>
 
   <style>
     :root{
@@ -44,7 +42,7 @@
     }
     button:hover { filter: brightness(1.15); }
 
-    input {
+    input[type="text"]{
       background:var(--panel);
       color:var(--text);
       padding:10px 12px;
@@ -69,10 +67,23 @@
       border:1px solid var(--border);
       border-radius:12px;
       padding:12px;
-      height: 560px; /* IMPORTANT: gives Chart.js a real height */
+      height: 560px;
+    }
+
+    .scroll-wrap{
+      display:flex;
+      gap:12px;
+      align-items:center;
+      margin-top:10px;
+    }
+
+    input[type="range"]{
+      width: 100%;
+      accent-color: #9aa7b2;
     }
   </style>
 </head>
+
 <body>
   <h2>Reflow Oven Control Dashboard</h2>
 
@@ -93,20 +104,27 @@
   </div>
 
   <div class="row">
-    <input id="setInput" placeholder="Set temp (25–260)" />
+    <input id="setInput" type="text" placeholder="Set temp (25–260)" />
     <button onclick="sendSet()">Set</button>
-    <button onclick="post('/api/start')">Start</button>
-    <button onclick="post('/api/abort')">Abort</button>
-    <button onclick="post('/api/idle')">Idle</button>
-    <button onclick="goLive()">Live</button>
+    <button onclick="postCmd('/api/start')">Start</button>
+    <button onclick="postCmd('/api/abort')">Abort</button>
+    <button onclick="postCmd('/api/idle')">Idle</button>
+    <button id="liveBtn" onclick="goLive()">Live</button>
   </div>
 
   <div class="chart-card">
     <canvas id="chart"></canvas>
+
+    <!-- Scrollbar: controls the RIGHT edge of the visible window (end time). -->
+    <div class="scroll-wrap">
+      <span class="muted" style="min-width:120px;">History</span>
+      <input id="timeScroll" type="range" min="0" max="0" step="1" value="0">
+      <span class="muted" id="scrollLabel" style="min-width:160px; text-align:right;">t = 0 s</span>
+    </div>
   </div>
 
   <script>
-    // ---- UI elements ----
+    // ===== UI =====
     const tempEl = document.getElementById("temp");
     const setEl  = document.getElementById("set");
     const modeEl = document.getElementById("mode");
@@ -117,29 +135,51 @@
     const statusTextEl = document.getElementById("statusText");
     const statusBadgeEl = document.getElementById("statusBadge");
 
-    // ---- Strip chart settings ----
-    let followLive = true;
-    const WINDOW_S = 120;   // show last 120 seconds
-    const POLL_MS  = 500;   // UI poll rate
-    const DT_FALLBACK_S = POLL_MS / 1000.0;
+    const slider = document.getElementById("timeScroll");
+    const scrollLabel = document.getElementById("scrollLabel");
+    const liveBtn = document.getElementById("liveBtn");
 
-    // Fixed y-axis: 20..275 with 25°C increments (fits nicely on screen)
+    function setConnectedUI(connected, label) {
+      statusTextEl.textContent = label;
+      statusBadgeEl.className = connected ? "badge ok" : "badge err";
+    }
+
+    // ===== Settings =====
+    const POLL_MS = 250;        // polling can be faster than data rate; seq gating prevents extra points
+    const VIEW_WINDOW_S = 120;  // visible window width
+
     const Y_MIN = 20;
     const Y_MAX = 275;
     const Y_STEP = 25;
 
-    // ---- Chart data (use linear x-axis for time) ----
-    const ctx = document.getElementById("chart").getContext("2d");
-    const data = {
-      datasets: [
-        { label: "Temp (°C)", data: [], spanGaps: false },
-        { label: "Set (°C)",  data: [], spanGaps: false }
-      ]
+    // Keep full history
+    const history = {
+      temp: [],
+      set:  []
     };
 
+    // followLive:
+    // - true: window follows newest data
+    // - false: user is viewing history
+    let followLive = true;
+
+    function updateLiveButton() {
+      liveBtn.textContent = followLive ? "Live" : "Live (resume)";
+    }
+
+    // Track samples (so we only append when a new line arrives)
+    let lastSeq = -1;
+
+    // ===== Chart.js =====
+    const ctx = document.getElementById("chart").getContext("2d");
     const chart = new Chart(ctx, {
       type: "line",
-      data,
+      data: {
+        datasets: [
+          { label: "Temp (°C)", data: [], spanGaps: false },
+          { label: "Set (°C)",  data: [], spanGaps: false }
+        ]
+      },
       options: {
         animation: false,
         parsing: false,
@@ -156,45 +196,71 @@
             ticks: { color: "#9aa7b2", maxTicksLimit: 8 },
             grid: { color: "rgba(154,167,178,0.15)" },
             min: 0,
-            max: WINDOW_S
+            max: VIEW_WINDOW_S
           },
           y: {
             min: Y_MIN,
             max: Y_MAX,
             title: { display: true, text: "Temperature (°C)", color: "#e6edf3" },
-            ticks: {
-              color: "#9aa7b2",
-              stepSize: Y_STEP
-            },
+            ticks: { color: "#9aa7b2", stepSize: Y_STEP },
             grid: { color: "rgba(154,167,178,0.15)" }
           }
         },
         plugins: {
-          legend: { labels: { color: "#e6edf3" } },
-          zoom: {
-            pan: {
-              enabled: true,
-              mode: "x",
-              modifierKey: "shift",
-              onPanComplete: () => { followLive = false; }
-            },
-            zoom: {
-              wheel: { enabled: true },
-              pinch: { enabled: true },
-              mode: "x",
-              onZoomComplete: () => { followLive = false; }
-            }
-          }
+          legend: { labels: { color: "#e6edf3" } }
         }
       }
     });
 
-    function setConnectedUI(connected, label) {
-      statusTextEl.textContent = label;
-      statusBadgeEl.className = connected ? "badge ok" : "badge err";
+    // ===== View control =====
+    function setSliderMax(endT) {
+      const endInt = Math.max(0, Math.floor(endT));
+      slider.max = String(endInt);
+
+      // If following live, keep slider pinned to the newest point
+      if (followLive) slider.value = String(endInt);
+
+      scrollLabel.textContent = `t = ${slider.value} s`;
     }
 
-    async function post(url, body) {
+    function updateView(endT) {
+      const end = Math.max(0, endT);
+      const start = Math.max(0, end - VIEW_WINDOW_S);
+
+      chart.options.scales.x.min = start;
+      chart.options.scales.x.max = end;
+
+      // show only the visible region (fast enough for our data sizes)
+      chart.data.datasets[0].data = history.temp.filter(p => p.x >= start && p.x <= end);
+      chart.data.datasets[1].data = history.set.filter(p => p.x >= start && p.x <= end);
+
+      chart.update();
+    }
+
+    slider.addEventListener("input", (e) => {
+      const endT = Number(e.target.value);
+
+      // If user is not at the far right, they are browsing history
+      followLive = (e.target.value === e.target.max);
+      updateLiveButton();
+
+      scrollLabel.textContent = `t = ${e.target.value} s`;
+      updateView(endT);
+    });
+
+    function goLive() {
+      followLive = true;
+      updateLiveButton();
+
+      slider.value = slider.max;
+      scrollLabel.textContent = `t = ${slider.value} s`;
+      updateView(Number(slider.value));
+
+      netStatusEl.textContent = "Following live";
+    }
+
+    // ===== Commands =====
+    async function postCmd(url, body) {
       try {
         const r = await fetch(url, {
           method: "POST",
@@ -211,18 +277,10 @@
     async function sendSet() {
       const v = parseFloat(document.getElementById("setInput").value);
       if (Number.isNaN(v)) { netStatusEl.textContent = "Bad set value"; return; }
-      await post("/api/set", {set: v});
+      await postCmd("/api/set", {set: v});
     }
 
-    function goLive() {
-      followLive = true;
-      chart.resetZoom();
-      netStatusEl.textContent = "Live follow enabled";
-    }
-
-    // Local time fallback so x-axis still moves even if backend doesn't change t
-    let lastT = 0;
-
+    // ===== Polling =====
     async function poll() {
       try {
         const r = await fetch("/api/latest", { cache: "no-store" });
@@ -239,34 +297,40 @@
         phaseEl.textContent = (m.phase ?? "--");
         pwmEl.textContent   = (m.pwm   ?? "--");
 
-        // time (seconds)
-        const t = (m.t == null) ? (lastT + DT_FALLBACK_S) : Number(m.t);
-        lastT = t;
-
-        // Append {x,y} points (null => gap)
-        data.datasets[0].data.push({ x: t, y: (m.temp == null ? null : Number(m.temp)) });
-        data.datasets[1].data.push({ x: t, y: (m.set  == null ? null : Number(m.set)) });
-
-        // Trim to window
-        const minT = t - WINDOW_S;
-        for (const ds of data.datasets) {
-          while (ds.data.length && ds.data[0].x < minT) ds.data.shift();
+        // Only append when a NEW sample arrives
+        if (m.seq == null) {
+          netStatusEl.textContent = "Backend missing seq";
+          return;
         }
-
-        // Move x-axis window only (y-axis fixed)
-        if (followLive) {
-          chart.options.scales.x.min = Math.max(0, minT);
-          chart.options.scales.x.max = t;
+        if (m.seq === lastSeq) {
+          // No new sample; still allow user scrolling without jitter
+          const endT = followLive ? Number(slider.max) : Number(slider.value);
+          updateView(endT);
+          return;
         }
+        lastSeq = m.seq;
 
-        chart.update();
-        netStatusEl.textContent = "Live";
+        const t = Number(m.t);
+
+        // Append to full history
+        history.temp.push({ x: t, y: (m.temp == null ? null : Number(m.temp)) });
+        history.set.push({  x: t, y: (m.set  == null ? null : Number(m.set)) });
+
+        // Update slider to reflect new end time
+        setSliderMax(t);
+
+        // Render the correct window
+        const endT = followLive ? Number(slider.max) : Number(slider.value);
+        updateView(endT);
+
+        netStatusEl.textContent = followLive ? "Live (auto-follow)" : "Viewing history";
       } catch {
         netStatusEl.textContent = "Poll error";
         setConnectedUI(false, "DISCONNECTED");
       }
     }
 
+    updateLiveButton();
     setInterval(poll, POLL_MS);
   </script>
 </body>
