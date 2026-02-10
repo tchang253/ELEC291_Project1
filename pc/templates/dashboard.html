@@ -1,0 +1,337 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Reflow Oven Control Dashboard</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    :root{
+      --bg:#0b0f14;
+      --panel:#121826;
+      --border:#263042;
+      --text:#e6edf3;
+      --muted:#9aa7b2;
+      --ok:#7ee787;
+      --err:#ff7b72;
+    }
+
+    body { background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, sans-serif; margin: 24px; }
+    h2 { margin-top: 0; }
+
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+
+    .card {
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:10px 12px;
+    }
+
+    .big { font-size: 24px; font-weight: 700; }
+    .muted { color:var(--muted); }
+
+    button {
+      background:var(--panel);
+      color:var(--text);
+      padding:10px 14px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      cursor:pointer;
+    }
+    button:hover { filter: brightness(1.15); }
+
+    input[type="text"]{
+      background:var(--panel);
+      color:var(--text);
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      width:160px;
+      outline:none;
+    }
+
+    .badge{
+      display:inline-block;
+      padding:2px 10px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      font-weight:700;
+    }
+    .badge.ok { color: var(--ok); }
+    .badge.err { color: var(--err); }
+
+    .chart-card{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:12px;
+      height: 560px;
+    }
+
+    .scroll-wrap{
+      display:flex;
+      gap:12px;
+      align-items:center;
+      margin-top:10px;
+    }
+
+    input[type="range"]{
+      width: 100%;
+      accent-color: #9aa7b2;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Reflow Oven Control Dashboard</h2>
+
+  <div class="row">
+    <div class="card big">Temp: <span id="temp">--</span> °C</div>
+    <div class="card">Set: <b><span id="set">--</span> °C</b></div>
+
+    <div class="card">
+      Status:
+      <span id="statusBadge" class="badge err"><span id="statusText">DISCONNECTED</span></span>
+    </div>
+
+    <div class="card">Mode: <b><span id="mode">--</span></b></div>
+    <div class="card">State: <b><span id="phase">--</span></b></div>
+    <div class="card">PWM: <b><span id="pwm">--</span>%</b></div>
+
+    <div class="card muted" id="netStatus">Polling…</div>
+  </div>
+
+  <div class="row">
+    <input id="setInput" type="text" placeholder="Set temp (25–260)" />
+    <button onclick="sendSet()">Set</button>
+    <button onclick="postCmd('/api/start')">Start</button>
+    <button onclick="postCmd('/api/abort')">Abort</button>
+    <button onclick="postCmd('/api/idle')">Idle</button>
+    <button id="liveBtn" onclick="goLive()">Live</button>
+  </div>
+
+  <div class="chart-card">
+    <canvas id="chart"></canvas>
+
+    <!-- Scrollbar: controls the RIGHT edge of the visible window (end time). -->
+    <div class="scroll-wrap">
+      <span class="muted" style="min-width:120px;">History</span>
+      <input id="timeScroll" type="range" min="0" max="0" step="1" value="0">
+      <span class="muted" id="scrollLabel" style="min-width:160px; text-align:right;">t = 0 s</span>
+    </div>
+  </div>
+
+  <script>
+    // ===== UI =====
+    const tempEl = document.getElementById("temp");
+    const setEl  = document.getElementById("set");
+    const modeEl = document.getElementById("mode");
+    const phaseEl= document.getElementById("phase");
+    const pwmEl  = document.getElementById("pwm");
+
+    const netStatusEl = document.getElementById("netStatus");
+    const statusTextEl = document.getElementById("statusText");
+    const statusBadgeEl = document.getElementById("statusBadge");
+
+    const slider = document.getElementById("timeScroll");
+    const scrollLabel = document.getElementById("scrollLabel");
+    const liveBtn = document.getElementById("liveBtn");
+
+    function setConnectedUI(connected, label) {
+      statusTextEl.textContent = label;
+      statusBadgeEl.className = connected ? "badge ok" : "badge err";
+    }
+
+    // ===== Settings =====
+    const POLL_MS = 250;        // polling can be faster than data rate; seq gating prevents extra points
+    const VIEW_WINDOW_S = 120;  // visible window width
+
+    const Y_MIN = 20;
+    const Y_MAX = 275;
+    const Y_STEP = 25;
+
+    // Keep full history
+    const history = {
+      temp: [],
+      set:  []
+    };
+
+    // followLive:
+    // - true: window follows newest data
+    // - false: user is viewing history
+    let followLive = true;
+
+    function updateLiveButton() {
+      liveBtn.textContent = followLive ? "Live" : "Live (resume)";
+    }
+
+    // Track samples (so we only append when a new line arrives)
+    let lastSeq = -1;
+
+    // ===== Chart.js =====
+    const ctx = document.getElementById("chart").getContext("2d");
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        datasets: [
+          { label: "Temp (°C)", data: [], spanGaps: false },
+          { label: "Set (°C)",  data: [], spanGaps: false }
+        ]
+      },
+      options: {
+        animation: false,
+        parsing: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        elements: {
+          point: { radius: 0 },
+          line: { tension: 0.15 }
+        },
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "Time (s)", color: "#e6edf3" },
+            ticks: { color: "#9aa7b2", maxTicksLimit: 8 },
+            grid: { color: "rgba(154,167,178,0.15)" },
+            min: 0,
+            max: VIEW_WINDOW_S
+          },
+          y: {
+            min: Y_MIN,
+            max: Y_MAX,
+            title: { display: true, text: "Temperature (°C)", color: "#e6edf3" },
+            ticks: { color: "#9aa7b2", stepSize: Y_STEP },
+            grid: { color: "rgba(154,167,178,0.15)" }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: "#e6edf3" } }
+        }
+      }
+    });
+
+    // ===== View control =====
+    function setSliderMax(endT) {
+      const endInt = Math.max(0, Math.floor(endT));
+      slider.max = String(endInt);
+
+      // If following live, keep slider pinned to the newest point
+      if (followLive) slider.value = String(endInt);
+
+      scrollLabel.textContent = `t = ${slider.value} s`;
+    }
+
+    function updateView(endT) {
+      const end = Math.max(0, endT);
+      const start = Math.max(0, end - VIEW_WINDOW_S);
+
+      chart.options.scales.x.min = start;
+      chart.options.scales.x.max = end;
+
+      // show only the visible region (fast enough for our data sizes)
+      chart.data.datasets[0].data = history.temp.filter(p => p.x >= start && p.x <= end);
+      chart.data.datasets[1].data = history.set.filter(p => p.x >= start && p.x <= end);
+
+      chart.update();
+    }
+
+    slider.addEventListener("input", (e) => {
+      const endT = Number(e.target.value);
+
+      // If user is not at the far right, they are browsing history
+      followLive = (e.target.value === e.target.max);
+      updateLiveButton();
+
+      scrollLabel.textContent = `t = ${e.target.value} s`;
+      updateView(endT);
+    });
+
+    function goLive() {
+      followLive = true;
+      updateLiveButton();
+
+      slider.value = slider.max;
+      scrollLabel.textContent = `t = ${slider.value} s`;
+      updateView(Number(slider.value));
+
+      netStatusEl.textContent = "Following live";
+    }
+
+    // ===== Commands =====
+    async function postCmd(url, body) {
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: body ? JSON.stringify(body) : null
+        });
+        const j = await r.json();
+        netStatusEl.textContent = j.ok ? "OK" : ("ERROR: " + (j.err ?? ""));
+      } catch {
+        netStatusEl.textContent = "Command error";
+      }
+    }
+
+    async function sendSet() {
+      const v = parseFloat(document.getElementById("setInput").value);
+      if (Number.isNaN(v)) { netStatusEl.textContent = "Bad set value"; return; }
+      await postCmd("/api/set", {set: v});
+    }
+
+    // ===== Polling =====
+    async function poll() {
+      try {
+        const r = await fetch("/api/latest", { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const m = await r.json();
+
+        const connected = (m.connected === true) || (m.status === "CONNECTED");
+        const statusLabel = m.status ?? (connected ? "CONNECTED" : "DISCONNECTED");
+        setConnectedUI(connected, statusLabel);
+
+        tempEl.textContent  = (m.temp == null) ? "--" : Number(m.temp).toFixed(1);
+        setEl.textContent   = (m.set  == null) ? "--" : Number(m.set).toFixed(1);
+        modeEl.textContent  = (m.mode  ?? "--");
+        phaseEl.textContent = (m.phase ?? "--");
+        pwmEl.textContent   = (m.pwm   ?? "--");
+
+        // Only append when a NEW sample arrives
+        if (m.seq == null) {
+          netStatusEl.textContent = "Backend missing seq";
+          return;
+        }
+        if (m.seq === lastSeq) {
+          // No new sample; still allow user scrolling without jitter
+          const endT = followLive ? Number(slider.max) : Number(slider.value);
+          updateView(endT);
+          return;
+        }
+        lastSeq = m.seq;
+
+        const t = Number(m.t);
+
+        // Append to full history
+        history.temp.push({ x: t, y: (m.temp == null ? null : Number(m.temp)) });
+        history.set.push({  x: t, y: (m.set  == null ? null : Number(m.set)) });
+
+        // Update slider to reflect new end time
+        setSliderMax(t);
+
+        // Render the correct window
+        const endT = followLive ? Number(slider.max) : Number(slider.value);
+        updateView(endT);
+
+        netStatusEl.textContent = followLive ? "Live (auto-follow)" : "Viewing history";
+      } catch {
+        netStatusEl.textContent = "Poll error";
+        setConnectedUI(false, "DISCONNECTED");
+      }
+    }
+
+    updateLiveButton();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
