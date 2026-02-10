@@ -29,6 +29,7 @@ state = {
     "pwm": None,
     "last_line": "",
     "seq": 0,                   # increments ONLY when a valid sample is received
+    "started": False,           # kept for compatibility (no longer gates telemetry)
 }
 
 _ser = None
@@ -95,6 +96,7 @@ def serial_send(line: str) -> bool:
 def _apply_parsed_sample(parsed: dict, raw_line: str):
     """Update state from a parsed sample. Called by both readers."""
     with lock:
+        # Telemetry is ALWAYS applied (no START/ABORT gating)
         state["t"] = _now_s()
         state["last_line"] = raw_line
         state["temp"] = parsed["temp"]
@@ -166,6 +168,7 @@ def serial_reader():
                 state["status"] = "DISCONNECTED"
                 state["pwm"] = None
                 state["last_line"] = f"(error: {e})"
+                # NOTE: do NOT touch state["started"] here (telemetry behavior independent)
 
             time.sleep(1)
 
@@ -200,7 +203,10 @@ def fake_serial_reader():
                 state["connected"] = False
                 state["status"] = "DISCONNECTED"
                 state["last_line"] = f"(fake error: {e})"
+                # NOTE: do NOT touch state["started"] here
+
             time.sleep(1)
+
             with lock:
                 state["connected"] = True
                 state["status"] = "CONNECTED"
@@ -221,17 +227,28 @@ def api_latest():
 # ---- commands ----
 @app.post("/api/start")
 def api_start():
+    # START should command the oven, but telemetry continues regardless
+    with lock:
+        state["started"] = True
+
     if USE_FAKE_SERIAL:
         with lock:
             state["mode"] = "RUN"
         return jsonify({"ok": True})
 
     ok = serial_send("CMD=START")
+    if not ok:
+        with lock:
+            state["started"] = False
     return jsonify({"ok": ok})
 
 
 @app.post("/api/abort")
 def api_abort():
+    # ABORT should command the oven, but telemetry continues regardless
+    with lock:
+        state["started"] = False
+
     if USE_FAKE_SERIAL:
         with lock:
             state["mode"] = "ABORT"
