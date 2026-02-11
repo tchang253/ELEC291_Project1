@@ -14,18 +14,20 @@
       --text:#e6edf3;
       --muted:#9aa7b2;
       --ok:#7ee787;
-      --okBorder:#9af2b4; /* ADDED */
+      --okBorder:#9af2b4;
       --err:#ff7b72;
       --abort:#ff4d4d;
       --abortBorder:#ff8080;
+
+      /* ADDED: dialog colors */
+      --warn:#f7d154;
+      --warnBorder:#ffe08a;
     }
 
     body { background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, sans-serif; margin: 24px; }
     h2 { margin-top: 0; }
 
     .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
-
-    /* NEW: keep top row from reflowing/jumping */
     .row.top { flex-wrap: nowrap; align-items: stretch; }
 
     .card {
@@ -38,22 +40,20 @@
     .big { font-size: 24px; font-weight: 700; }
     .muted { color:var(--muted); }
 
-    /* NEW: fixed-size KPI cards so text changes don't resize layout */
     .kpi { min-width: 170px; width: 170px; white-space: nowrap; }
     .kpi-wide { min-width: 220px; width: 220px; white-space: nowrap; }
     .kpi-temp { min-width: 210px; width: 210px; white-space: nowrap; }
 
-    /* NEW: tabular digits + fixed slot width so numbers don't shift */
     .num {
       font-variant-numeric: tabular-nums;
       font-feature-settings: "tnum" 1;
       display: inline-block;
       text-align: right;
     }
-    .num.temp { min-width: 64px; }   /* fits --- / 275.0 */
+    .num.temp { min-width: 64px; }
     .num.set  { min-width: 64px; }
     .num.pwm  { min-width: 48px; }
-    .num.time { min-width: 52px; }   /* m:ss */
+    .num.time { min-width: 52px; }
 
     button {
       background:var(--panel);
@@ -68,10 +68,7 @@
     button:hover { filter: brightness(1.15); }
     button:active { transform: translateY(1px); }
 
-    /* ADDED: START button styling */
-    .btn-start {
-      border-color: var(--okBorder);
-    }
+    .btn-start { border-color: var(--okBorder); }
     .btn-start.armed {
       background: rgba(126,231,135,0.18);
       border-color: var(--okBorder);
@@ -80,9 +77,7 @@
     }
     .btn-start.armed:hover { filter:none; background: rgba(126,231,135,0.22); }
 
-    .btn-abort {
-      border-color: var(--abortBorder);
-    }
+    .btn-abort { border-color: var(--abortBorder); }
     .btn-abort.armed {
       background: rgba(255,77,77,0.18);
       border-color: var(--abortBorder);
@@ -109,7 +104,6 @@
       border:1px solid var(--border);
       font-weight:700;
       white-space: nowrap;
-      /* NEW: make badge width stable */
       min-width: 128px;
       text-align: center;
     }
@@ -135,13 +129,48 @@
       width: 100%;
       accent-color: #9aa7b2;
     }
+
+    .controls-row { align-items: flex-end; }
+    .spacer-left { width: 404px; }
+    .spacer-right { flex: 1; }
+    .dialog-span { width: 402px; }
+
+    .dialog {
+      height: 44px;
+      display:flex;
+      align-items:center;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      pointer-events: none;
+    }
+
+    /* ADDED: dialog states */
+    .dialog.ok {
+      background: rgba(126,231,135,0.18);
+      border-color: var(--okBorder);
+      color: var(--ok);
+      box-shadow: 0 0 0 2px rgba(126,231,135,0.18) inset;
+    }
+    .dialog.warn {
+      background: rgba(247,209,84,0.16);
+      border-color: var(--warnBorder);
+      color: var(--warn);
+      box-shadow: 0 0 0 2px rgba(247,209,84,0.14) inset;
+    }
+    .dialog.crit {
+      background: rgba(255,77,77,0.18);
+      border-color: var(--abortBorder);
+      color: var(--abort);
+      box-shadow: 0 0 0 2px rgba(255,77,77,0.18) inset;
+    }
   </style>
 </head>
 
 <body>
   <h2>Reflow Oven Control Dashboard</h2>
 
-  <!-- CHANGED: add class "top" + fixed-size KPI classes -->
   <div class="row top">
     <div class="card big kpi-temp">
       Temp: <span id="temp" class="num temp">--</span> °C
@@ -171,11 +200,14 @@
     <div class="card muted kpi-wide" id="netStatus">Polling…</div>
   </div>
 
-  <div class="row">
-    <!-- removed Set temp input + Set button -->
+  <div class="row controls-row">
     <button id="startBtn" class="btn-start" onclick="doStart()">START</button>
     <button id="liveBtn" onclick="goLive()">Live</button>
     <button id="abortBtn" class="btn-abort" onclick="doAbort()">ABORT</button>
+
+    <div class="spacer-left"></div>
+    <div id="dialog" class="card dialog dialog-span"></div>
+    <div class="spacer-right"></div>
   </div>
 
   <div class="chart-card">
@@ -198,6 +230,51 @@
     const netStatusEl = document.getElementById("netStatus");
     const statusTextEl = document.getElementById("statusText");
     const statusBadgeEl = document.getElementById("statusBadge");
+
+    const dialogEl = document.getElementById("dialog");
+    let dialogTimer = null;
+
+    /* ===== CHANGED: sticky CRITICAL support (until IDLE AND temp <= 60) ===== */
+    let dialogStickyCrit = false;
+
+    function clearDialog() {
+      dialogEl.textContent = "";
+      dialogEl.classList.remove("ok","warn","crit");
+      dialogStickyCrit = false;
+      if (dialogTimer) { clearTimeout(dialogTimer); dialogTimer = null; }
+
+      /* ADDED: when CRITICAL clears, ABORT should no longer look "armed" */
+      setAbortArmed(false);
+    }
+
+    // ADDED: dialog helper (color-coded)
+    function showDialog(msg, level) {
+      /* ADDED: if CRITICAL is sticky, ignore non-critical updates */
+      if (dialogStickyCrit && level !== "crit") return;
+
+      dialogEl.textContent = msg;
+
+      // clear classes then add requested one
+      dialogEl.classList.remove("ok","warn","crit");
+      if (level === "ok") dialogEl.classList.add("ok");
+      else if (level === "warn") dialogEl.classList.add("warn");
+      else if (level === "crit") dialogEl.classList.add("crit");
+
+      // CHANGED: CRITICAL is sticky (no timer)
+      if (dialogTimer) { clearTimeout(dialogTimer); dialogTimer = null; }
+      if (level === "crit") {
+        dialogStickyCrit = true;
+        return;
+      }
+
+      dialogStickyCrit = false;
+      dialogTimer = setTimeout(() => {
+        dialogEl.textContent = "";
+        dialogEl.classList.remove("ok","warn","crit");
+        dialogTimer = null;
+      }, 3000);
+    }
+    /* ===== END CHANGED ===== */
 
     const slider = document.getElementById("timeScroll");
     const liveBtn = document.getElementById("liveBtn");
@@ -228,13 +305,16 @@
     let tZero = null;
 
     // --- Run timer (On time) state ---
-    let runActive = false;        // true after START until ABORT
-    let runStartBackendT = null;  // backend m.t when start pressed (set on next poll)
-    let runFrozenSeconds = 0;     // frozen elapsed time after ABORT
-    let lastBackendT = 0;         // last seen backend time for accurate freeze
+    let runActive = false;
+    let runStartBackendT = null;
+    let runFrozenSeconds = 0;
+    let lastBackendT = 0;
 
-    // On-time tracking (resets when disconnected)
     let connectedPrev = false;
+
+    let lastPhaseStr = "--";
+    let lastTempC = null;
+    let prevPhaseStr = "--";
 
     function fmtMMSS(seconds) {
       const s = Math.max(0, Math.floor(seconds));
@@ -243,14 +323,12 @@
       return `${m}:${String(r).padStart(2,"0")}`;
     }
 
-    // Abort button "armed" latch
     let abortArmed = false;
     function setAbortArmed(armed) {
       abortArmed = armed;
       abortBtn.classList.toggle("armed", armed);
     }
 
-    /* ADDED: Start button "armed" latch */
     let startArmed = false;
     function setStartArmed(armed) {
       startArmed = armed;
@@ -341,43 +419,60 @@
           body: body ? JSON.stringify(body) : null
         });
         const j = await r.json();
-        netStatusEl.textContent = j.ok ? "OK" : ("ERROR: " + (j.err ?? ""));
+
+        // only show errors here
+        if (!j.ok) showDialog("ERROR: " + (j.err ?? ""), "crit");
         return !!j.ok;
       } catch {
-        netStatusEl.textContent = "Command error";
+        showDialog("Command error", "crit");
         return false;
       }
     }
 
     async function sendSet() {
       const v = parseFloat(document.getElementById("setInput").value);
-      if (Number.isNaN(v)) { netStatusEl.textContent = "Bad set value"; return; }
+      if (Number.isNaN(v)) { showDialog("Bad set value", "warn"); return; }
       await postCmd("/api/set", {set: v});
     }
 
-    /* UPDATED: START should reset & start the On time counter */
     async function doStart() {
+      /* ADDED: if CRITICAL is sticky, ignore START attempts */
+      if (dialogStickyCrit) return;
+
+      if (lastPhaseStr === "COOLING") {
+        showDialog("Warning: please wait until the temp is ≤ 60 °C", "warn");
+        return;
+      }
+      if (lastPhaseStr !== "IDLE") {
+        showDialog("Warning: cycle in progress, please wait.", "warn");
+        return;
+      }
+      if (lastTempC != null && Number(lastTempC) > 60) {
+        showDialog("Warning: please wait until the temp is ≤ 60 °C", "warn");
+        return;
+      }
+
       const ok = await postCmd("/api/start");
       if (ok) {
         setStartArmed(true);
         setAbortArmed(false);
 
-        // START -> start counting from 0
         runActive = true;
-        runStartBackendT = null; // set on next poll using m.t
+        runStartBackendT = null;
         runFrozenSeconds = 0;
         onTimeEl.textContent = "0:00";
+
+        // GREEN dialog on successful start
+        showDialog("Cycle initiated — transitioning to PREHEAT.", "ok");
       }
     }
 
-    /* UPDATED: ABORT freezes On time, and clears START state */
     async function doAbort() {
       const ok = await postCmd("/api/abort");
       if (ok) {
         setAbortArmed(true);
         setStartArmed(false);
 
-        // ABORT -> freeze elapsed time
         if (runActive) {
           if (runStartBackendT == null) runFrozenSeconds = 0;
           else runFrozenSeconds = Math.max(0, lastBackendT - runStartBackendT);
@@ -385,8 +480,10 @@
         runActive = false;
         runStartBackendT = null;
 
-        // keep showing frozen time
         onTimeEl.textContent = fmtMMSS(runFrozenSeconds);
+
+        // RED dialog on abort (STICKY until IDLE AND temp <= 60)
+        showDialog("CRITICAL: cycle aborted, heating disabled.", "crit");
       }
     }
 
@@ -397,14 +494,12 @@
         if (!r.ok) throw new Error("HTTP " + r.status);
         const m = await r.json();
 
-        // always track backend time
         lastBackendT = Number(m.t ?? 0);
 
         const connected = (m.connected === true) || (m.status === "CONNECTED");
         const statusLabel = m.status ?? (connected ? "CONNECTED" : "DISCONNECTED");
         setConnectedUI(connected, statusLabel);
 
-        // Disconnect resets run timer
         if (!connected) {
           runActive = false;
           runStartBackendT = null;
@@ -412,8 +507,10 @@
           onTimeEl.textContent = "0:00";
           setAbortArmed(false);
           setStartArmed(false);
+
+          /* CHANGED */
+          clearDialog();
         } else {
-          // If run is active, count. If not active, show frozen.
           if (runActive) {
             if (runStartBackendT === null) runStartBackendT = lastBackendT;
             const elapsed = Math.max(0, lastBackendT - runStartBackendT);
@@ -429,6 +526,15 @@
         const phaseStr = (m.phase ?? "--");
         phaseEl.textContent = phaseStr;
 
+        lastPhaseStr = phaseStr;
+        lastTempC = (m.temp == null) ? null : Number(m.temp);
+
+        /* ADDED: clear sticky CRITICAL ONLY when IDLE AND temp <= 60 */
+        if (dialogStickyCrit && phaseStr === "IDLE" && lastTempC != null && Number(lastTempC) <= 60) {
+          clearDialog();
+          clearAbortArmed(false);
+        }
+
         const hideTarget = (phaseStr === "IDLE" || phaseStr === "COOLING");
         if (hideTarget) {
           setEl.textContent = "";
@@ -439,6 +545,11 @@
         }
 
         pwmEl.textContent   = (m.pwm   ?? "--");
+
+        if (prevPhaseStr === "COOLING" && phaseStr === "IDLE" && m.temp != null && Number(m.temp) <= 60) {
+          setStartArmed(false);
+        }
+        prevPhaseStr = phaseStr;
 
         if (m.seq == null) {
           netStatusEl.textContent = "Backend missing seq";
@@ -477,6 +588,9 @@
         connectedPrev = false;
         setAbortArmed(false);
         setStartArmed(false);
+
+        /* CHANGED */
+        clearDialog();
       }
     }
 
