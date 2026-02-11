@@ -4,12 +4,12 @@ from flask import Flask, jsonify, request, render_template
 import serial
 
 # ---- config ----
-USE_FAKE_SERIAL = True
+USE_FAKE_SERIAL = False
 FAKE_FILE = "fake_serial.txt"
 FAKE_PERIOD_S = 1.0
 
-SERIAL_PORT = "COM3"
-SERIAL_BAUD = 115200
+SERIAL_PORT = "COM4"
+SERIAL_BAUD = 57600
 SERIAL_TIMEOUT_S = 1
 # --------------
 
@@ -299,4 +299,4 @@ if __name__ == "__main__":
     else:
         threading.Thread(target=serial_reader, daemon=True).start()
 
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
