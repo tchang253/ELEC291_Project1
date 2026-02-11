@@ -148,7 +148,7 @@
     </div>
 
     <div class="card kpi">
-      Set: <b><span id="set" class="num set">--</span> °C</b>
+      Target: <b><span id="set" class="num set">--</span><span id="setUnit"> °C</span></b>
     </div>
 
     <div class="card kpi-wide">
@@ -172,9 +172,7 @@
   </div>
 
   <div class="row">
-    <input id="setInput" type="text" placeholder="Set temp (25–260)" />
-    <button onclick="sendSet()">Set</button>
-    <!-- CHANGED: Start button now all caps + green when armed -->
+    <!-- removed Set temp input + Set button -->
     <button id="startBtn" class="btn-start" onclick="doStart()">START</button>
     <button id="liveBtn" onclick="goLive()">Live</button>
     <button id="abortBtn" class="btn-abort" onclick="doAbort()">ABORT</button>
@@ -192,6 +190,7 @@
     // ===== UI =====
     const tempEl = document.getElementById("temp");
     const setEl  = document.getElementById("set");
+    const setUnitEl = document.getElementById("setUnit");
     const phaseEl= document.getElementById("phase");
     const pwmEl  = document.getElementById("pwm");
     const onTimeEl = document.getElementById("onTime");
@@ -218,7 +217,7 @@
     const Y_MAX = 275;
     const Y_STEP = 25;
 
-    const history = { temp: [], set: [] };
+    const history = { temp: [] };
     let followLive = true;
 
     function updateLiveButton() {
@@ -264,8 +263,7 @@
       type: "line",
       data: {
         datasets: [
-          { label: "Temp (°C)", data: [], spanGaps: false },
-          { label: "Set (°C)",  data: [], spanGaps: false }
+          { label: "Temp (°C)", data: [], spanGaps: false }
         ]
       },
       options: {
@@ -315,7 +313,6 @@
       chart.options.scales.x.max = shownEnd;
 
       chart.data.datasets[0].data = history.temp.filter(p => p.x >= start && p.x <= shownEnd);
-      chart.data.datasets[1].data = history.set.filter(p => p.x >= start && p.x <= shownEnd);
 
       chart.update();
     }
@@ -428,8 +425,19 @@
         connectedPrev = connected;
 
         tempEl.textContent  = (m.temp == null) ? "--" : Number(m.temp).toFixed(1);
-        setEl.textContent   = (m.set  == null) ? "--" : Number(m.set).toFixed(1);
-        phaseEl.textContent = (m.phase ?? "--");
+
+        const phaseStr = (m.phase ?? "--");
+        phaseEl.textContent = phaseStr;
+
+        const hideTarget = (phaseStr === "IDLE" || phaseStr === "COOLING");
+        if (hideTarget) {
+          setEl.textContent = "";
+          setUnitEl.textContent = "";
+        } else {
+          setEl.textContent   = (m.set  == null) ? "--" : Number(m.set).toFixed(1);
+          setUnitEl.textContent = " °C";
+        }
+
         pwmEl.textContent   = (m.pwm   ?? "--");
 
         if (m.seq == null) {
@@ -450,7 +458,6 @@
         const t = Number(m.t) - tZero;
 
         history.temp.push({ x: t, y: (m.temp == null ? null : Number(m.temp)) });
-        history.set.push({  x: t, y: (m.set  == null ? null : Number(m.set)) });
 
         setSliderMax(t);
 

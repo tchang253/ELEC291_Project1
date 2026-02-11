@@ -69,7 +69,7 @@ def parse_line(line: str):
             except:
                 pass
         elif k == "state":
-            out["phase"] = v
+            out["phase"] = v.strip().upper()
         elif k == "pwm":
             try:
                 out["pwm"] = int(float(v))
