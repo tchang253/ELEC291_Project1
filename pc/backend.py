@@ -2,9 +2,12 @@ import threading
 import time
 from flask import Flask, jsonify, request, render_template
 import serial
+import io
+import csv
+from flask import Response
 
 # ---- config ----
-USE_FAKE_SERIAL = False
+USE_FAKE_SERIAL = True
 FAKE_FILE = "fake_serial.txt"
 FAKE_PERIOD_S = 1.0
 
@@ -25,12 +28,20 @@ state = {
     "connected": False,
     "status": "DISCONNECTED",   # DISCONNECTED / CONNECTING / CONNECTED
     "mode": "IDLE",             # IDLE / RUN / ABORT (or whatever firmware reports)
-    "phase": "AMBIENT",         # AMBIENT / RAMP / SOAK / REFLOW / COOL (firmware reports as state=...)
+    "phase": "IDLE",            # IDLE / PREHEAT / SOAK / RAMP / REFLOW / COOLING (firmware reports as state=...)
     "pwm": None,
     "last_line": "",
     "seq": 0,                   # increments ONLY when a valid sample is received
     "started": False,           # kept for compatibility (no longer gates telemetry)
 }
+
+# ---- run log (since last START) ----
+run_log = []                 # list of raw serial lines
+run_log_active = False       # only True after a successful START
+run_log_lock = threading.Lock()
+
+# ADDED: run-relative time base (t=0 at last successful START)
+run_start_t = None
 
 _ser = None
 _ser_lock = threading.Lock()
@@ -110,6 +121,11 @@ def _apply_parsed_sample(parsed: dict, raw_line: str):
             state["mode"] = parsed["mode"]
 
         state["seq"] += 1
+
+    global run_log_active, run_start_t
+    if run_log_active:
+        with run_log_lock:
+            run_log.append(raw_line)
 
 
 def serial_reader():
@@ -227,37 +243,98 @@ def api_latest():
 # ---- commands ----
 @app.post("/api/start")
 def api_start():
-    # START should command the oven, but telemetry continues regardless
+    global run_log_active, run_start_t
+
+    print("START POST from:", request.remote_addr, "UA:", request.headers.get("User-Agent"))
+    """
+    START allowed only when:
+      - connected == True
+      - phase == IDLE
+      - temp <= 60
+    Special case:
+      - if phase == COOLING and temp > 60 -> COOLING_TOO_HOT
+    """
     with lock:
-        state["started"] = True
+        connected = state["connected"]
+        phase = state["phase"]
+        temp = state["temp"]
+
+    if not connected:
+        return jsonify(ok=False, reason="DISCONNECTED"), 200
+
+    if phase == "COOLING" and temp is not None and temp > 60.0:
+        return jsonify(ok=False, reason="COOLING_TOO_HOT", temp=temp), 200
+
+    if phase != "IDLE":
+        return jsonify(ok=False, reason="NOT_IDLE", phase=phase), 200
+
+    if temp is None:
+        return jsonify(ok=False, reason="NO_TEMP"), 200
+
+    if temp > 60.0:
+        return jsonify(ok=False, reason="TOO_HOT", temp=temp), 200
 
     if USE_FAKE_SERIAL:
         with lock:
+            state["started"] = True
             state["mode"] = "RUN"
-        return jsonify({"ok": True})
+            state["phase"] = "PREHEAT"
+
+        with run_log_lock:
+            run_log.clear()
+        run_start_t = _now_s()  # ADDED: t=0 reference for export
+        run_log_active = True
+
+        return jsonify(ok=True), 200
 
     ok = serial_send("CMD=START")
-    if not ok:
-        with lock:
-            state["started"] = False
-    return jsonify({"ok": ok})
+    with lock:
+        state["started"] = ok
+
+    if ok:
+        with run_log_lock:
+            run_log.clear()
+        run_start_t = _now_s()  # ADDED: t=0 reference for export
+        run_log_active = True
+
+    return jsonify(ok=ok, reason=None if ok else "SERIAL_WRITE_FAIL"), 200
 
 
 @app.post("/api/abort")
 def api_abort():
-    # ABORT should command the oven, but telemetry continues regardless
+    """
+    Always tries to abort if connected.
+    Returns phase so Discord can choose the right message:
+      - if PREHEAT/SOAK/RAMP/REFLOW -> "heating ceased..."
+      - if COOLING -> "already in COOLING..."
+      - if IDLE -> "already in IDLE..."
+    """
     with lock:
-        state["started"] = False
+        connected = state["connected"]
+        phase = state["phase"]
+
+    if not connected:
+        return jsonify(ok=False, reason="DISCONNECTED"), 200
 
     if USE_FAKE_SERIAL:
         with lock:
+            state["started"] = False
             state["mode"] = "ABORT"
             state["pwm"] = 0
-            state["phase"] = "COOL"
-        return jsonify({"ok": True})
+            if state["phase"] != "IDLE":
+                state["phase"] = "COOLING"
+        return jsonify(ok=True, phase=phase), 200
 
     ok = serial_send("CMD=ABORT")
-    return jsonify({"ok": ok})
+
+    if ok:
+        with lock:
+            state["started"] = False
+            state["pwm"] = 0
+            if state["phase"] != "IDLE":
+                state["phase"] = "COOLING"
+
+    return jsonify(ok=ok, reason=None if ok else "SERIAL_WRITE_FAIL", phase=phase), 200
 
 
 @app.post("/api/idle")
@@ -266,7 +343,7 @@ def api_idle():
         with lock:
             state["mode"] = "IDLE"
             state["pwm"] = 0
-            state["phase"] = "AMBIENT"
+            state["phase"] = "IDLE"
         return jsonify({"ok": True})
 
     ok = serial_send("CMD=IDLE")
@@ -293,10 +370,75 @@ def api_set():
     return jsonify({"ok": ok, "set": state["set"]})
 
 
+@app.get("/api/export")
+def api_export():
+    global run_start_t
+
+    with run_log_lock:
+        lines = list(run_log)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # CSV header
+    writer.writerow(["t", "temp", "set", "state", "pwm"])
+
+    # ADDED: export time base (t=0 at last START)
+    start_t = run_start_t
+    if start_t is None:
+        start_t = 0
+
+    for line in lines:
+        parts = {}
+        for field in line.split(","):
+            if "=" in field:
+                k, v = field.split("=", 1)
+                parts[k.strip()] = v.strip()
+
+        # ADDED: per-row time, derived from number of samples at 1Hz
+        # (keeps behavior minimal without restructuring run_log storage)
+        # If your serial is exactly 1 line/sec, this matches reality.
+        # t = 0..N-1
+        # NOTE: This is the minimal change approach given current run_log format.
+        # We’ll compute index-based time to ensure CSV starts at 0.
+        #
+        # If you later want real timestamps, switch run_log to store (t, line).
+        pass
+
+    # Re-write rows with index-based t so it starts from 0
+    for i, line in enumerate(lines):
+        parts = {}
+        for field in line.split(","):
+            if "=" in field:
+                k, v = field.split("=", 1)
+                parts[k.strip()] = v.strip()
+
+        writer.writerow([
+            i,  # CHANGED: starts at 0 for export
+            parts.get("temp", ""),
+            parts.get("set", ""),
+            parts.get("state", ""),
+            parts.get("pwm", ""),
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+
+    return Response(
+        data,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=run_log.csv"
+        },
+    )
+
+
 if __name__ == "__main__":
     if USE_FAKE_SERIAL:
         threading.Thread(target=fake_serial_reader, daemon=True).start()
     else:
         threading.Thread(target=serial_reader, daemon=True).start()
 
-    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
+    if USE_FAKE_SERIAL:
+        app.run(host="127.0.0.1", port=5000, debug=True)
+    else:
+        app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
