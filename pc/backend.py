@@ -7,7 +7,7 @@ import csv
 from flask import Response
 
 # ---- config ----
-USE_FAKE_SERIAL = True
+USE_FAKE_SERIAL = False
 FAKE_FILE = "fake_serial.txt"
 FAKE_PERIOD_S = 1.0
 
@@ -36,8 +36,8 @@ state = {
 }
 
 # ---- run log (since last START) ----
-run_log = []                 # list of raw serial lines
-run_log_active = False       # only True after a successful START
+run_log = []                 # CHANGED: list of (t_rel, raw serial line)
+run_log_active = False       # only True after a successful START (or MCU-detected START)
 run_log_lock = threading.Lock()
 
 # ADDED: run-relative time base (t=0 at last successful START)
@@ -106,7 +106,12 @@ def serial_send(line: str) -> bool:
 
 def _apply_parsed_sample(parsed: dict, raw_line: str):
     """Update state from a parsed sample. Called by both readers."""
+    global run_log_active, run_start_t
+
+    # CHANGED: capture prev phase so we can detect MCU-triggered START (IDLE->PREHEAT)
     with lock:
+        prev_phase = state.get("phase", "IDLE")
+
         # Telemetry is ALWAYS applied (no START/ABORT gating)
         state["t"] = _now_s()
         state["last_line"] = raw_line
@@ -122,10 +127,23 @@ def _apply_parsed_sample(parsed: dict, raw_line: str):
 
         state["seq"] += 1
 
-    global run_log_active, run_start_t
+        new_phase = state.get("phase", prev_phase)
+        now_t = state["t"]
+
+    # CHANGED: auto-arm logging on MCU-triggered START (telemetry IDLE -> PREHEAT)
+    if (not run_log_active) and (prev_phase == "IDLE") and (new_phase == "PREHEAT"):
+        with run_log_lock:
+            run_log.clear()
+            run_start_t = now_t
+            run_log_active = True
+
+    # CHANGED: append with run-relative time
     if run_log_active:
         with run_log_lock:
-            run_log.append(raw_line)
+            if run_start_t is None:
+                run_start_t = now_t
+            t_rel = max(0, now_t - run_start_t)
+            run_log.append((t_rel, raw_line))
 
 
 def serial_reader():
@@ -375,7 +393,7 @@ def api_export():
     global run_start_t
 
     with run_log_lock:
-        lines = list(run_log)
+        rows = list(run_log)  # CHANGED: list of (t_rel, line)
 
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -383,30 +401,7 @@ def api_export():
     # CSV header
     writer.writerow(["t", "temp", "set", "state", "pwm"])
 
-    # ADDED: export time base (t=0 at last START)
-    start_t = run_start_t
-    if start_t is None:
-        start_t = 0
-
-    for line in lines:
-        parts = {}
-        for field in line.split(","):
-            if "=" in field:
-                k, v = field.split("=", 1)
-                parts[k.strip()] = v.strip()
-
-        # ADDED: per-row time, derived from number of samples at 1Hz
-        # (keeps behavior minimal without restructuring run_log storage)
-        # If your serial is exactly 1 line/sec, this matches reality.
-        # t = 0..N-1
-        # NOTE: This is the minimal change approach given current run_log format.
-        # We’ll compute index-based time to ensure CSV starts at 0.
-        #
-        # If you later want real timestamps, switch run_log to store (t, line).
-        pass
-
-    # Re-write rows with index-based t so it starts from 0
-    for i, line in enumerate(lines):
+    for (t_rel, line) in rows:
         parts = {}
         for field in line.split(","):
             if "=" in field:
@@ -414,7 +409,7 @@ def api_export():
                 parts[k.strip()] = v.strip()
 
         writer.writerow([
-            i,  # CHANGED: starts at 0 for export
+            t_rel,
             parts.get("temp", ""),
             parts.get("set", ""),
             parts.get("state", ""),
@@ -430,7 +425,6 @@ def api_export():
             "Content-Disposition": "attachment; filename=run_log.csv"
         },
     )
-
 
 if __name__ == "__main__":
     if USE_FAKE_SERIAL:
