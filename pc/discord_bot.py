@@ -17,12 +17,9 @@ client = discord.Client(intents=intents)
 session: aiohttp.ClientSession | None = None
 
 def fmt_state(latest: dict) -> str:
-    # Adjust these keys to match your /api/latest JSON
-    phase = latest.get("phase", "UNKNOWN")      # e.g. IDLE/PREHEAT/SOAK/REFLOW/COOLING/ABORTED
-    #mode  = latest.get("mode")                 # optional, if you have it
+    phase = latest.get("phase", "UNKNOWN")     #IDLE / PREHEAT / SOAK / RAMP / REFLOW/ COOLING 
     temp  = latest.get("temp")
 
-    # if you want "MODE/PHASE", keep this, otherwise just phase
     state_label = f"{phase}"
 
     if temp is None:
@@ -30,7 +27,7 @@ def fmt_state(latest: dict) -> str:
     return f"{state_label} @ {temp:.1f}°C"
 
 async def safe_get_latest():
-    """Returns (ok, latest_or_error_string). ok=True means backend reachable."""
+    #ok = backend is reacheable
     assert session is not None
     try:
         async with session.get(API_BASE + "/api/latest") as resp:
@@ -40,7 +37,9 @@ async def safe_get_latest():
         return False, str(e)
 
 async def safe_post(path: str):
-    """Returns (ok, resp_json_or_error_string)."""
+
+    #returns (ok, resp_json_or_error_string)
+
     assert session is not None
     try:
         async with session.post(API_BASE + path) as resp:
@@ -50,7 +49,6 @@ async def safe_post(path: str):
         return False, str(e)
 
 async def safe_get_bytes(path: str):
-    """Returns (ok, bytes_or_error_string)."""
     assert session is not None
     try:
         async with session.get(API_BASE + path) as resp:
@@ -70,17 +68,17 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    # require mention
+    #require mention in chat
     if client.user not in message.mentions:
         return
 
-    # strip mention(s)
+    #strip the mention message
     content = message.content
     for m in message.mentions:
         content = content.replace(m.mention, "")
     cmd = content.strip().lower()
 
-    # --- Case 3: backend unreachable ---
+    #case 3: the backend is unreachable (bot can still respond)
     ok, latest_or_err = await safe_get_latest()
     if not ok:
         await message.channel.send("⚠️ Warning: Could not communicate with backend, please check connection.")
@@ -89,37 +87,37 @@ async def on_message(message):
     latest = latest_or_err
     connected = bool(latest.get("connected", False))
 
-    # --- Case 1: backend reachable but MCU disconnected ---
+    #case 2: the backend is reachable but it is disconnected from the MCU
     if not connected:
         await message.channel.send("⚠️ Warning: Currently disconnected, please check connection.")
         return
 
-    # --- Case 2: backend reachable and connected ---
+    #case 1: the backend is reachable and the MCU is connected 
     if cmd == "status":
         await message.channel.send(fmt_state(latest))
         return
 
     if cmd == "start":
-        # Pre-check (NO POST unless allowed)
+        #checking if START is allowed
         phase = str(latest.get("phase", "")).strip().upper()
         temp = latest.get("temp", None)
         temp_val = None if temp is None else float(temp)
 
-        # Block if cycle already underway (phase not IDLE)
+        #block POST START command when cycle is already underway (requirements not met)
         if phase != "IDLE":
-            # Special message if cooling and still hot
+            #message for the case where it is in COOLING and temp > 60
             if phase == "COOLING" and temp_val is not None and temp_val > 60.0:
                 await message.channel.send("⚠️ Warning: START command cannot be sent, please wait until temp <= 60°C")
             else:
                 await message.channel.send("⚠️ Warning: START command cannot be sent, please wait until cycle complete.")
             return
 
-        # Block if IDLE but still too hot
+        #block START in IDLE and if temp > 60
         if temp_val is not None and temp_val > 60.0:
             await message.channel.send("⚠️ Warning: START command cannot be sent, please wait until cycle complete.")
             return
 
-        # ONLY if allowed do we POST
+        #message if the bot sends a POST
         ok2, resp_or_err = await safe_post("/api/start")
         if not ok2:
             await message.channel.send("⚠️ Warning: Could not communicate with backend, please check connection.")
