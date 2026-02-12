@@ -244,7 +244,7 @@
       if (dialogTimer) { clearTimeout(dialogTimer); dialogTimer = null; }
 
       /* ADDED: when CRITICAL clears, ABORT should no longer look "armed" */
-      setAbortArmed(false);
+      //setAbortArmed(false);
     }
 
     // ADDED: dialog helper (color-coded)
@@ -529,10 +529,64 @@
         lastPhaseStr = phaseStr;
         lastTempC = (m.temp == null) ? null : Number(m.temp);
 
+        /* CHANGED: mirror Discord-triggered START/ABORT by reacting to PHASE transitions */
+
+        // External START shows up as IDLE -> PREHEAT
+        if (prevPhaseStr === "IDLE" && phaseStr === "PREHEAT") {
+          setStartArmed(true);
+          setAbortArmed(false);
+
+          runActive = true;
+          runStartBackendT = null;
+          runFrozenSeconds = 0;
+          onTimeEl.textContent = "0:00";
+
+          showDialog("Success: cycle initiated, transitioning to PREHEAT.", "ok");
+        }
+
+        /* NEW: any deviation from expected phase path triggers UI-only ABORT */
+        function isExpectedTransition(prevP, nextP) {
+          if (prevP === nextP) return true; // staying in same state is fine
+
+          // expected "golden path"
+          if (prevP === "IDLE"    && nextP === "PREHEAT") return true;
+          if (prevP === "PREHEAT" && nextP === "SOAK")    return true;
+          if (prevP === "SOAK"    && nextP === "RAMP")    return true;
+          if (prevP === "RAMP"    && nextP === "REFLOW")  return true;
+          if (prevP === "REFLOW"  && nextP === "COOLING") return true;
+          if (prevP === "COOLING" && nextP === "IDLE")    return true;
+
+          return false;
+        }
+
+        // Only evaluate deviations once we are "in a run" (i.e., not starting from unknown)
+        // Here: if we've ever seen a PREHEAT at least once this session, we treat deviations as abort-worthy.
+        // Minimal: we just check whenever prevPhaseStr is known and not "--".
+        if (prevPhaseStr !== "--" && phaseStr !== "--") {
+          const okTransition = isExpectedTransition(prevPhaseStr, phaseStr);
+
+          // If it's not an expected transition, trigger UI-only abort
+          if (!okTransition) {
+            setAbortArmed(true);
+            setStartArmed(false);
+
+            if (runActive) {
+              if (runStartBackendT == null) runFrozenSeconds = 0;
+              else runFrozenSeconds = Math.max(0, lastBackendT - runStartBackendT);
+            }
+            runActive = false;
+            runStartBackendT = null;
+
+            onTimeEl.textContent = fmtMMSS(runFrozenSeconds);
+
+            showDialog("CRITICAL: cycle aborted, heating disabled", "crit");
+          }
+        }
+
         /* ADDED: clear sticky CRITICAL ONLY when IDLE AND temp <= 60 */
         if (dialogStickyCrit && phaseStr === "IDLE" && lastTempC != null && Number(lastTempC) <= 60) {
           clearDialog();
-          clearAbortArmed(false);
+          setAbortArmed(false);
         }
 
         const hideTarget = (phaseStr === "IDLE" || phaseStr === "COOLING");
@@ -549,6 +603,7 @@
         if (prevPhaseStr === "COOLING" && phaseStr === "IDLE" && m.temp != null && Number(m.temp) <= 60) {
           setStartArmed(false);
         }
+
         prevPhaseStr = phaseStr;
 
         if (m.seq == null) {
