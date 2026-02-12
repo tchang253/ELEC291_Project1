@@ -6,7 +6,7 @@ import io
 import csv
 from flask import Response
 
-# ---- config ----
+#serial config
 USE_FAKE_SERIAL = False
 FAKE_FILE = "fake_serial.txt"
 FAKE_PERIOD_S = 1.0
@@ -14,7 +14,6 @@ FAKE_PERIOD_S = 1.0
 SERIAL_PORT = "COM4"
 SERIAL_BAUD = 57600
 SERIAL_TIMEOUT_S = 1
-# --------------
 
 app = Flask(__name__)
 lock = threading.Lock()
@@ -26,21 +25,21 @@ state = {
     "temp": None,
     "set": None,
     "connected": False,
-    "status": "DISCONNECTED",   # DISCONNECTED / CONNECTING / CONNECTED
-    "mode": "IDLE",             # IDLE / RUN / ABORT (or whatever firmware reports)
-    "phase": "IDLE",            # IDLE / PREHEAT / SOAK / RAMP / REFLOW / COOLING (firmware reports as state=...)
+    "status": "DISCONNECTED",   #DISCONNECTED / CONNECTING / CONNECTED
+    "mode": "IDLE",             #IDLE / RUN / ABORT (or whatever firmware reports to the backend)
+    "phase": "IDLE",            #IDLE / PREHEAT / SOAK / RAMP / REFLOW / COOLING
     "pwm": None,
     "last_line": "",
     "seq": 0,                   # increments ONLY when a valid sample is received
     "started": False,           # kept for compatibility (no longer gates telemetry)
 }
 
-# ---- run log (since last START) ----
-run_log = []                 # CHANGED: list of (t_rel, raw serial line)
-run_log_active = False       # only True after a successful START (or MCU-detected START)
+#logging only after START detected
+run_log = []
+run_log_active = False       #becomes TRUE after START detected
 run_log_lock = threading.Lock()
 
-# ADDED: run-relative time base (t=0 at last successful START)
+#time logging is START time relative (time since last START)
 run_start_t = None
 
 _ser = None
@@ -50,13 +49,8 @@ _ser_lock = threading.Lock()
 def _now_s() -> int:
     return int(time.time() - t0)
 
-
+#expected serial output temp=183.4,set=180.0,state=SOAK,pwm=20
 def parse_line(line: str):
-    """
-    Expected line:
-      temp=183.4,set=180.0,state=SOAK,pwm=20
-    Must contain temp=...
-    """
     s = line.strip()
     if not s:
         return None
@@ -105,14 +99,13 @@ def serial_send(line: str) -> bool:
 
 
 def _apply_parsed_sample(parsed: dict, raw_line: str):
-    """Update state from a parsed sample. Called by both readers."""
     global run_log_active, run_start_t
 
-    # CHANGED: capture prev phase so we can detect MCU-triggered START (IDLE->PREHEAT)
+    #holds the previous state for START and ABORT detection
     with lock:
         prev_phase = state.get("phase", "IDLE")
 
-        # Telemetry is ALWAYS applied (no START/ABORT gating)
+        #telemetry is always live (no matter the state or ABORT)
         state["t"] = _now_s()
         state["last_line"] = raw_line
         state["temp"] = parsed["temp"]
@@ -129,21 +122,30 @@ def _apply_parsed_sample(parsed: dict, raw_line: str):
 
         new_phase = state.get("phase", prev_phase)
         now_t = state["t"]
+        now_temp = state.get("temp", None)  # ADDED: for log stop condition
 
-    # CHANGED: auto-arm logging on MCU-triggered START (telemetry IDLE -> PREHEAT)
+    #begins logging when a START is detected run_log_active = TRUE
     if (not run_log_active) and (prev_phase == "IDLE") and (new_phase == "PREHEAT"):
         with run_log_lock:
             run_log.clear()
             run_start_t = now_t
             run_log_active = True
 
-    # CHANGED: append with run-relative time
+    #append the csv with the time relative time stamp (time from last START)
     if run_log_active:
         with run_log_lock:
             if run_start_t is None:
                 run_start_t = now_t
             t_rel = max(0, now_t - run_start_t)
             run_log.append((t_rel, raw_line))
+
+        #STOP logging ONLY when START is cleared condition is met:
+        #state == IDLE AND temp <= 60
+        try:
+            if (new_phase == "IDLE") and (now_temp is not None) and (float(now_temp) <= 60.0):
+                run_log_active = False
+        except:
+            pass
 
 
 def serial_reader():
@@ -206,9 +208,8 @@ def serial_reader():
 
             time.sleep(1)
 
-
+#fake serial reader (for testing only) forces CONNECTED status and reads from .txt file rather than serial
 def fake_serial_reader():
-    # Fake mode: treat as "connected" and stream samples from a file at FAKE_PERIOD_S
     with lock:
         state["connected"] = True
         state["status"] = "CONNECTED"
@@ -258,20 +259,15 @@ def api_latest():
         return jsonify(state)
 
 
-# ---- commands ----
+#commands
 @app.post("/api/start")
 def api_start():
     global run_log_active, run_start_t
+    
+    #only allows START when IDLE -> PREHEAT and temp <= 60
+    #has special case of when in COOLING and temp > 60 (TOO_HOT)
 
     print("START POST from:", request.remote_addr, "UA:", request.headers.get("User-Agent"))
-    """
-    START allowed only when:
-      - connected == True
-      - phase == IDLE
-      - temp <= 60
-    Special case:
-      - if phase == COOLING and temp > 60 -> COOLING_TOO_HOT
-    """
     with lock:
         connected = state["connected"]
         phase = state["phase"]
@@ -300,7 +296,7 @@ def api_start():
 
         with run_log_lock:
             run_log.clear()
-        run_start_t = _now_s()  # ADDED: t=0 reference for export
+        run_start_t = _now_s()  #time is relative to the latest START detection
         run_log_active = True
 
         return jsonify(ok=True), 200
@@ -312,7 +308,7 @@ def api_start():
     if ok:
         with run_log_lock:
             run_log.clear()
-        run_start_t = _now_s()  # ADDED: t=0 reference for export
+        run_start_t = _now_s() 
         run_log_active = True
 
     return jsonify(ok=ok, reason=None if ok else "SERIAL_WRITE_FAIL"), 200
@@ -320,13 +316,10 @@ def api_start():
 
 @app.post("/api/abort")
 def api_abort():
-    """
-    Always tries to abort if connected.
-    Returns phase so Discord can choose the right message:
-      - if PREHEAT/SOAK/RAMP/REFLOW -> "heating ceased..."
-      - if COOLING -> "already in COOLING..."
-      - if IDLE -> "already in IDLE..."
-    """
+
+    #will always try to ABORT if connected
+    #helps choosing the right message to send on discord (state and temp dependent)
+
     with lock:
         connected = state["connected"]
         phase = state["phase"]
@@ -393,12 +386,12 @@ def api_export():
     global run_start_t
 
     with run_log_lock:
-        rows = list(run_log)  # CHANGED: list of (t_rel, line)
+        rows = list(run_log)
 
     buf = io.StringIO()
     writer = csv.writer(buf)
 
-    # CSV header
+    #CSV header (for export)
     writer.writerow(["t", "temp", "set", "state", "pwm"])
 
     for (t_rel, line) in rows:
